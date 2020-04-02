@@ -1,131 +1,134 @@
-use serde::Deserialize;
-use std::collections::HashMap;
-use std::env;
-use std::fs::File;
-use std::io::Read;
-use std::time::{SystemTime, UNIX_EPOCH};
+use twitter_and_me::client::TwitterClient;
+use twitter_and_me::config::{read_json_file, write_json_file, Config};
+use twitter_and_me::Result;
 
-#[derive(Deserialize, Debug)]
-struct Response {
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+
+const TWITTER_CONF: &str = ".twitter.json";
+const FRIENDS_IDS: &str = "friends_ids.json";
+const FOLLOWERS_IDS: &str = "followers_ids.json";
+
+#[derive(Deserialize, Serialize)]
+struct Ids {
     ids: Vec<i64>,
-    next_cursor: i64,
-    previous_cursor: i64,
+    cursor: i64,
 }
 
-#[derive(Deserialize, Debug)]
-struct TokenResponse {
-    token_type: String,
-    access_token: String,
-}
-
-#[derive(Deserialize, Debug)]
-struct RateLimitStatus {
-    resources: RateLimitResources,
-}
-
-#[derive(Deserialize, Debug)]
-struct RateLimitResources {
-    friends: HashMap<String, RateLimitEntry>,
-    followers: HashMap<String, RateLimitEntry>,
-    application: HashMap<String, RateLimitEntry>,
-}
-
-#[derive(Deserialize, Debug)]
-struct RateLimitEntry {
-    limit: i64,
-    remaining: i64,
-    reset: i64,
-}
-
-#[derive(Deserialize, Debug)]
-struct Config {
-    key: String,
-    secret: String,
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut f = File::open(".twitter.json")?;
-    let mut buffer = String::new();
-    f.read_to_string(&mut buffer)?;
-
-    let keys: Vec<Config> = serde_json::from_str(&buffer)?;
-
-    for config in keys.iter() {
-        match TwitterClient::new(&config.key, &config.secret).await {
-            Ok(client) => {
-                let response = client.rate_limit_status().await?;
-                println!("{:?}", response.resources.friends.get("/friends/ids"));
-                println!("{:?}", response.resources.followers.get("/followers/ids"));
+async fn load_ff(clients: &Vec<TwitterClient>) -> Result<()> {
+    loop {
+        let mut friends = read_json_file::<Ids>(FRIENDS_IDS).unwrap_or(Ids {
+            ids: vec![],
+            cursor: -1,
+        });
+        log::info!("friends={}", friends.ids.len());
+        if friends.cursor != 0 {
+            let mut client: Option<&TwitterClient> = None;
+            for (i, c) in clients.iter().enumerate() {
+                let status = c.rate_limit_status().await?;
+                let remaining = status.friends_ids().expect("Failed to get /friends/ids");
+                if remaining > 0 {
+                    client = Some(c);
+                    break;
+                } else {
+                    log::warn!("client {}: {:?}", i, status);
+                }
             }
-            Err(e) => {
-                println!("{:?} {:?}", config, e);
+
+            if let Some(client) = client {
+                let ids = client.friends_ids("kenkoooo", friends.cursor).await?;
+                friends.ids.extend(ids.ids);
+                friends.cursor = ids.next_cursor;
+                write_json_file(friends, FRIENDS_IDS)?;
+            } else {
+                log::warn!("No client is available for /friends/ids");
+            }
+        }
+
+        let mut followers = read_json_file::<Ids>(FOLLOWERS_IDS).unwrap_or(Ids {
+            ids: vec![],
+            cursor: -1,
+        });
+        log::info!("followers={}", followers.ids.len());
+        if followers.cursor != 0 {
+            let mut client: Option<&TwitterClient> = None;
+            for (i, c) in clients.iter().enumerate() {
+                let status = c.rate_limit_status().await?;
+                let remaining = status
+                    .followers_ids()
+                    .expect("Failed to get /followers/ids");
+                if remaining > 0 {
+                    client = Some(c);
+                    break;
+                } else {
+                    log::warn!("client {}: {:?}", i, status);
+                }
+            }
+
+            if let Some(client) = client {
+                let ids = client.followers_ids("kenkoooo", followers.cursor).await?;
+                followers.ids.extend(ids.ids);
+                followers.cursor = ids.next_cursor;
+                write_json_file(followers, FOLLOWERS_IDS)?;
+            } else {
+                log::warn!("No client is available for /followers/ids");
             }
         }
     }
+}
 
+async fn initialize_clients() -> Result<Vec<TwitterClient>> {
+    let configs = read_json_file::<Vec<Config>>(TWITTER_CONF)?;
+    let mut clients = vec![];
+    for config in configs.into_iter() {
+        match TwitterClient::new(&config.key, &config.secret).await {
+            Ok(client) => clients.push(client),
+            Err(e) => log::warn!("{:?} {:?}", config, e),
+        }
+    }
+    Ok(clients)
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    simple_logger::init().unwrap();
+
+    let friends = read_json_file::<Ids>(FRIENDS_IDS)?.ids;
+    let followers = read_json_file::<Ids>(FOLLOWERS_IDS)?
+        .ids
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let to_remove: Vec<_> = friends
+        .into_iter()
+        .rev()
+        .filter(|id| !followers.contains(id))
+        .collect();
+    log::info!("removing: {}", to_remove.len());
+
+    let clients = initialize_clients().await?;
+    for client in clients.iter() {
+        let status = client.rate_limit_status().await?;
+        let remaining = status.users_lookup().expect("/users/lookup");
+        if remaining == 0 {
+            log::warn!("{:?}", status);
+            continue;
+        }
+        let users = client.users_lookup(&to_remove[..100]).await?;
+        for user in users.iter() {
+            println!(
+                "{} {}",
+                user.name,
+                if user.protected { "(protected)" } else { "" }
+            );
+            println!(
+                "Friends: {}, Followers: {}",
+                user.friends_count, user.followers_count
+            );
+            println!("{}", user.description);
+            println!("https://twitter.com/{}", user.screen_name);
+            println!();
+        }
+        break;
+    }
     Ok(())
-}
-
-struct TwitterClient {
-    client: reqwest::Client,
-    bearer_token: String,
-}
-
-impl TwitterClient {
-    async fn new(consumer_key: &str, consumer_secret: &str) -> Result<Self, reqwest::Error> {
-        let client = reqwest::ClientBuilder::new().gzip(true).build()?;
-        let key = format!("{}:{}", consumer_key, consumer_secret);
-        let auth_header = format!("Basic {}", base64::encode(key));
-        let response = client
-            .post("https://api.twitter.com/oauth2/token")
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                "application/x-www-form-urlencoded;charset=UTF-8",
-            )
-            .header(reqwest::header::AUTHORIZATION, auth_header)
-            .form(&[("grant_type", "client_credentials")])
-            .send()
-            .await?
-            .json::<TokenResponse>()
-            .await?;
-        Ok(Self {
-            bearer_token: response.access_token,
-            client,
-        })
-    }
-
-    async fn rate_limit_status(&self) -> Result<RateLimitStatus, reqwest::Error> {
-        self.client
-            .get("https://api.twitter.com/1.1/application/rate_limit_status.json")
-            .header(
-                reqwest::header::AUTHORIZATION,
-                format!("Bearer {}", self.bearer_token),
-            )
-            .query(&[("resources", "friends,followers,application")])
-            .send()
-            .await?
-            .json::<RateLimitStatus>()
-            .await
-    }
-
-    async fn friends_ids(
-        &self,
-        screen_name: &str,
-        cursor: i64,
-    ) -> Result<Response, reqwest::Error> {
-        self.client
-            .get("https://api.twitter.com/1.1/friends/ids.json")
-            .header(
-                reqwest::header::AUTHORIZATION,
-                format!("Bearer {}", self.bearer_token),
-            )
-            .query(&[("screen_name", screen_name)])
-            .query(&[("cursor", cursor)])
-            .query(&[("count", 5000)])
-            .send()
-            .await?
-            .json::<Response>()
-            .await
-    }
 }
