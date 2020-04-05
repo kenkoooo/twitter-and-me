@@ -1,9 +1,12 @@
 use twitter_and_me::client::TwitterClient;
-use twitter_and_me::config::{read_json_file, write_json_file, Config};
+use twitter_and_me::io::{read_json_file, write_html_file, write_json_file, Config};
 use twitter_and_me::Result;
 
+use askama::Template;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use twitter_and_me::model::User;
 
 const TWITTER_CONF: &str = ".twitter.json";
 const FRIENDS_IDS: &str = "friends_ids.json";
@@ -21,7 +24,7 @@ async fn load_ff(clients: &Vec<TwitterClient>) -> Result<()> {
             ids: vec![],
             cursor: -1,
         });
-        log::info!("friends={}", friends.ids.len());
+        info!("friends={}", friends.ids.len());
         if friends.cursor != 0 {
             let mut client: Option<&TwitterClient> = None;
             for (i, c) in clients.iter().enumerate() {
@@ -31,7 +34,7 @@ async fn load_ff(clients: &Vec<TwitterClient>) -> Result<()> {
                     client = Some(c);
                     break;
                 } else {
-                    log::warn!("client {}: {:?}", i, status);
+                    warn!("client {}: {:?}", i, status);
                 }
             }
 
@@ -41,7 +44,7 @@ async fn load_ff(clients: &Vec<TwitterClient>) -> Result<()> {
                 friends.cursor = ids.next_cursor;
                 write_json_file(friends, FRIENDS_IDS)?;
             } else {
-                log::warn!("No client is available for /friends/ids");
+                warn!("No client is available for /friends/ids");
             }
         }
 
@@ -49,7 +52,7 @@ async fn load_ff(clients: &Vec<TwitterClient>) -> Result<()> {
             ids: vec![],
             cursor: -1,
         });
-        log::info!("followers={}", followers.ids.len());
+        info!("followers={}", followers.ids.len());
         if followers.cursor != 0 {
             let mut client: Option<&TwitterClient> = None;
             for (i, c) in clients.iter().enumerate() {
@@ -61,7 +64,7 @@ async fn load_ff(clients: &Vec<TwitterClient>) -> Result<()> {
                     client = Some(c);
                     break;
                 } else {
-                    log::warn!("client {}: {:?}", i, status);
+                    warn!("client {}: {:?}", i, status);
                 }
             }
 
@@ -71,7 +74,7 @@ async fn load_ff(clients: &Vec<TwitterClient>) -> Result<()> {
                 followers.cursor = ids.next_cursor;
                 write_json_file(followers, FOLLOWERS_IDS)?;
             } else {
-                log::warn!("No client is available for /followers/ids");
+                warn!("No client is available for /followers/ids");
             }
         }
     }
@@ -83,52 +86,100 @@ async fn initialize_clients() -> Result<Vec<TwitterClient>> {
     for config in configs.into_iter() {
         match TwitterClient::new(&config.key, &config.secret).await {
             Ok(client) => clients.push(client),
-            Err(e) => log::warn!("{:?} {:?}", config, e),
+            Err(e) => warn!("{:?} {:?}", config, e),
         }
     }
     Ok(clients)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    simple_logger::init().unwrap();
+#[derive(Template)]
+#[template(path = "users.html")]
+struct UsersTemplate {
+    users: Vec<User>,
+}
 
-    let friends = read_json_file::<Ids>(FRIENDS_IDS)?.ids;
-    let followers = read_json_file::<Ids>(FOLLOWERS_IDS)?
+async fn lookup_users(clients: &Vec<TwitterClient>, mut ids: Vec<i64>) -> Result<Vec<User>> {
+    let mut users: Vec<User> = vec![];
+    let mut fetch_count = 0;
+    while !ids.is_empty() && fetch_count < 10 {
+        let ids = ids.pop_n(100);
+
+        for client in clients.iter() {
+            let status = client.rate_limit_status().await?;
+            let remaining = status.users_lookup().expect("/users/lookup");
+            if remaining == 0 {
+                warn!("{:?}", status);
+                continue;
+            }
+
+            info!("Fetching {} users ...", ids.len());
+            let u = client.users_lookup(&ids).await?;
+            users.extend(u);
+            fetch_count += 1;
+            break;
+        }
+    }
+    Ok(users)
+}
+
+fn sub_set(id_file: &str, already_file: &str) -> Result<Vec<i64>> {
+    let friends = read_json_file::<Ids>(already_file)?
         .ids
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let to_remove: Vec<_> = friends
+    let to_follow = read_json_file::<Ids>(id_file)?
+        .ids
         .into_iter()
         .rev()
-        .filter(|id| !followers.contains(id))
-        .collect();
-    log::info!("removing: {}", to_remove.len());
+        .filter(|id| !friends.contains(&id))
+        .collect::<Vec<_>>();
+    Ok(to_follow)
+}
 
+async fn generate_follow_list(clients: &Vec<TwitterClient>) -> Result<()> {
+    let to_follow = sub_set(FOLLOWERS_IDS, FRIENDS_IDS)?;
+    info!("following: {}", to_follow.len());
+    let users = lookup_users(clients, to_follow).await?;
+    let users = users
+        .into_iter()
+        .filter(|user| !user.protected && user.statuses_count > 5)
+        .collect();
+    let html = UsersTemplate { users };
+    write_html_file(html, "follow_list.html")
+}
+async fn generate_remove_list(clients: &Vec<TwitterClient>) -> Result<()> {
+    let to_remove = sub_set(FRIENDS_IDS, FOLLOWERS_IDS)?;
+    info!("removing: {}", to_remove.len());
+    let users = lookup_users(clients, to_remove).await?;
+    let users = users.into_iter().collect();
+    let html = UsersTemplate { users };
+    write_html_file(html, "remove_list.html")
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    simple_logger::init_with_level(log::Level::Info).unwrap();
     let clients = initialize_clients().await?;
-    for client in clients.iter() {
-        let status = client.rate_limit_status().await?;
-        let remaining = status.users_lookup().expect("/users/lookup");
-        if remaining == 0 {
-            log::warn!("{:?}", status);
-            continue;
-        }
-        let users = client.users_lookup(&to_remove[..100]).await?;
-        for user in users.iter() {
-            println!(
-                "{} {}",
-                user.name,
-                if user.protected { "(protected)" } else { "" }
-            );
-            println!(
-                "Friends: {}, Followers: {}",
-                user.friends_count, user.followers_count
-            );
-            println!("{}", user.description);
-            println!("https://twitter.com/{}", user.screen_name);
-            println!();
-        }
-        break;
-    }
+
+    // generate_remove_list(&clients).await?;
+    generate_follow_list(&clients).await?;
+
     Ok(())
+}
+
+trait VecExt<T> {
+    fn pop_n(&mut self, n: usize) -> Vec<T>;
+}
+
+impl<T> VecExt<T> for Vec<T> {
+    fn pop_n(&mut self, n: usize) -> Vec<T> {
+        let mut result = vec![];
+        while let Some(v) = self.pop() {
+            result.push(v);
+            if result.len() == n {
+                break;
+            }
+        }
+        result
+    }
 }

@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Users</title>
+</head>
+
+<body>
+    {% for user in users %}
+    <div>
+        <div>
+            <img src="{{ user.profile_image_url_https }}" />
+        </div>
+        <div>
+            {% if user.protected %}🔒{% endif %}
+            <a href="https://twitter.com/{{ user.screen_name }}" target="_blank">
+                {{ user.name }} @{{ user.screen_name }}
+            </a>
+        </div>
+        <div>
+            <p>{{ user.description }}</p>
+        </div>
+        <div>
+            <p>Follow: {{ user.friends_count }} Follower: {{ user.followers_count }} Tweets: {{ user.statuses_count }}
+            </p>
+        </div>
+    </div>
+    {% endfor %}
+
+</body>
+
+</html>

@@ -3,6 +3,7 @@ pub enum Error {
     JsonError(serde_json::Error),
     IOError(std::io::Error),
     HTTPError(reqwest::Error),
+    HtmlRenderError(askama::Error),
 }
 
 impl From<serde_json::Error> for Error {
@@ -20,5 +21,11 @@ impl From<std::io::Error> for Error {
 impl From<reqwest::Error> for Error {
     fn from(e: reqwest::Error) -> Self {
         Error::HTTPError(e)
+    }
+}
+
+impl From<askama::Error> for Error {
+    fn from(e: askama::Error) -> Self {
+        Error::HtmlRenderError(e)
     }
 }

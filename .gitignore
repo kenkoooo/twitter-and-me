@@ -17,3 +17,4 @@ Cargo.lock
 .twitter.json
 .idea
 *.json
+*.html
